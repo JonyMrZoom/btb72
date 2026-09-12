@@ -20,6 +20,7 @@ const SECRET = 'b2b2026-smeni-menya';
 const SHEET = 'Заявки';
 const DASH  = 'Дашборд';
 const HELP  = 'Служебное';
+const LISTS = 'Списки';
 const INFO  = 'Инструкция';
 
 /** Номинации. Порядок задаёт порядок столбцов-флагов и строк на дашборде. */
@@ -37,28 +38,53 @@ const MARK = '✓';
 
 const BLUE = '#2233DD';
 
+/* --------------------------------------------------------------------------
+   Разделитель аргументов в формулах зависит от языка таблицы:
+   в английской это запятая, в русской — точка с запятой.
+   Определяем его один раз пробной формулой и подставляем куда нужно.
+   В шаблонах формул разделитель пишется знаком |
+   -------------------------------------------------------------------------- */
+let SEP = null;
+
+function sep() {
+  if (SEP) return SEP;
+  const ss = SpreadsheetApp.getActive();
+  const tmp = ss.insertSheet('__probe__');
+  try {
+    tmp.getRange('A1').setFormula('=SUM(1,2)');
+    SpreadsheetApp.flush();
+    SEP = (tmp.getRange('A1').getValue() === 3) ? ',' : ';';
+  } catch (e) {
+    SEP = ';';
+  }
+  ss.deleteSheet(tmp);
+  return SEP;
+}
+
+/** Подставляет верный разделитель в шаблон формулы. */
+function F(tpl) {
+  return tpl.split('|').join(sep());
+}
+
 /* ========================================================================== */
 /*  ПРИЁМ ЗАЯВОК                                                              */
 /* ========================================================================== */
 
 function doPost(e) {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(25000);
   try {
     const d = JSON.parse(e.postData.contents);
     if (d.secret !== SECRET) return out({ ok:false, error:'bad secret' });
 
-    const sh = getSheet();
+    const sh = SpreadsheetApp.getActive().getSheetByName(SHEET) || getSheet();
 
     // Заявка уже есть — меняем статус. Ищем по ID, а не по номеру строки,
     // поэтому сортировка и ручные вставки строк ничего не ломают.
     if (d.id) {
       const row = findRowById(sh, d.id);
       if (row) {
-        const cur = String(sh.getRange(row, C.STATUS).getValue());
-        if (cur === 'Ждём скриншот' || cur === '') {
-          sh.getRange(row, C.STATUS).setValue(d.status || cur);
-        }
+        const cell = sh.getRange(row, C.STATUS);
+        const cur = String(cell.getValue());
+        if (cur === 'Ждём скриншот' || cur === '') cell.setValue(d.status || cur);
         return out({ ok:true, id:d.id, updated:true });
       }
       if (d.updateOnly) return out({ ok:true, notFound:true });
@@ -66,19 +92,15 @@ function doPost(e) {
 
     if (d.updateOnly) return out({ ok:true, skipped:true });
 
+    // appendRow атомарен, блокировка не нужна: она только добавляла задержку
     const id = d.id || newId();
     sh.appendRow(buildRow(d, id));
-    const row = sh.getLastRow();
-    sh.getRange(row, C.DATE).setNumberFormat('dd.MM.yyyy HH:mm');
-    sh.getRange(row, C.SUM).setNumberFormat('#,##0 ₽');
-    markDuplicate(sh, row, d.phone);
 
-    return out({ ok:true, id:id, row:row });
+    // форматы даты и суммы уже стоят на всём столбце — на строку их не ставим
+    return out({ ok:true, id:id });
 
   } catch (err) {
     return out({ ok:false, error:String(err) });
-  } finally {
-    lock.releaseLock();
   }
 }
 
@@ -154,12 +176,13 @@ function onEdit(e) {
     const row = e.range.getRow();
     const col = e.range.getColumn();
     if (row < 2) return;
-    if (col > C.NOMS || col + e.range.getNumColumns() - 1 < C.NOMS) return;
 
+    // поправили номинации руками → пересчитываем галочки в столбцах-фильтрах
+    if (col > C.NOMS || col + e.range.getNumColumns() - 1 < C.NOMS) return;
     const n = e.range.getNumRows();
     const vals = sh.getRange(row, C.NOMS, n, 1).getValues();
-    const flags = vals.map(function (v) { return flagsFor(v[0]); });
-    sh.getRange(row, C.FLAG, n, NOMS.length).setValues(flags);
+    sh.getRange(row, C.FLAG, n, NOMS.length)
+      .setValues(vals.map(function (v) { return flagsFor(v[0]); }));
   } catch (err) {
     // тихо: onEdit не должен ломать работу с таблицей
   }
@@ -195,11 +218,26 @@ function fillMissingIds() {
 /*  СБОРКА ТАБЛИЦЫ                                                            */
 /* ========================================================================== */
 
+/**
+ * Apps Script пишет формулы с запятыми, а в русской локали разделитель — точка с запятой.
+ * Из-за этого все формулы с двумя аргументами падали в #ERROR!.
+ * Переводим таблицу в англоязычную локаль: на отображение денег и дат это не влияет,
+ * форматы у нас заданы явно.
+ */
+function ensureLocale(ss) {
+  if (ss.getSpreadsheetLocale() !== 'en_US') {
+    ss.setSpreadsheetLocale('en_US');
+    SpreadsheetApp.flush();
+  }
+}
+
 function setupWorkbook() {
   const ss = SpreadsheetApp.getActive();
-  buildSheet(ss);
+  ensureLocale(ss);
   buildHelper(ss);
+  buildSheet(ss);
   buildDashboard(ss);
+  buildNomSheets(ss);
   buildInfo(ss);
 
   // порядок листов
@@ -207,11 +245,42 @@ function setupWorkbook() {
   ss.moveActiveSheet(1);
   ss.setActiveSheet(ss.getSheetByName(SHEET));
   ss.moveActiveSheet(2);
+  NOMS.forEach(function (n, i) {
+    const sh = ss.getSheetByName(n);
+    if (sh) { ss.setActiveSheet(sh); ss.moveActiveSheet(3 + i); }
+  });
 
   const def = ss.getSheetByName('Лист1') || ss.getSheetByName('Sheet1');
   if (def && def.getLastRow() === 0) ss.deleteSheet(def);
 
-  SpreadsheetApp.getUi().alert('Готово. Листы «Дашборд», «Заявки», «Служебное» и «Инструкция» собраны.');
+  SpreadsheetApp.getUi().alert('Готово. Собран дашборд, лист заявок и по вкладке на каждую номинацию.');
+}
+
+
+/**
+ * Лист, пришедший из файла, может иметь ровно столько столбцов, сколько было
+ * в исходнике. Новые столбцы вроде «Явки» тогда оказываются за краем сетки
+ * и любая запись в них падает с ошибкой. Здесь лист при необходимости расширяется.
+ */
+/** Убирает столбец «Явка», если он остался от прошлой версии. */
+function dropAttendanceColumn(sh) {
+  if (!sh) return;
+  const width = sh.getMaxColumns();
+  for (let c = width; c > HEADERS.length; c--) {
+    const head = String(sh.getRange(1, c).getValue()).trim();
+    if (head === 'Явка' || head === '') {
+      if (head === 'Явка') sh.deleteColumn(c);
+    }
+  }
+  sh.getRange(1, HEADERS.length + 1, sh.getMaxRows(),
+              Math.max(sh.getMaxColumns() - HEADERS.length, 1))
+    .clearDataValidations();
+}
+
+function ensureColumns(sh, need) {
+  const have = sh.getMaxColumns();
+  if (have < need) sh.insertColumnsAfter(have, need - have);
+  return sh;
 }
 
 function getSheet() {
@@ -221,11 +290,12 @@ function getSheet() {
     sh = ss.insertSheet(SHEET);
     sh.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
   }
+  ensureColumns(sh, HEADERS.length);
   return sh;
 }
 
 function buildSheet(ss) {
-  const sh = ss.getSheetByName(SHEET) || ss.insertSheet(SHEET);
+  const sh = ensureColumns(ss.getSheetByName(SHEET) || ss.insertSheet(SHEET), HEADERS.length);
 
   sh.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS])
     .setFontWeight('bold').setFontSize(10).setFontColor('#FFFFFF')
@@ -236,11 +306,17 @@ function buildSheet(ss) {
   sh.setFrozenRows(1);
   sh.setFrozenColumns(5);
 
-  const widths = [110, 140, 155, 185, 155, 135, 130, 240, 150, 95, 105, 165, 230];
+  const widths = [110, 125, 150, 175, 140, 130, 115, 200, 140, 90, 105, 165, 200];
   widths.forEach(function (w, i) { sh.setColumnWidth(i + 1, w); });
-  for (let i = 0; i < NOMS.length; i++) sh.setColumnWidth(C.FLAG + i, 92);
+  for (let i = 0; i < NOMS.length; i++) sh.setColumnWidth(C.FLAG + i, 84);
 
-  sh.hideColumns(C.ID);   // технический столбец, участнику не показывается
+  // прячем то, что при работе почти не нужно, — иначе столбцы с номинациями
+  // уезжают за край экрана и их никто не находит
+  sh.showColumns(1, HEADERS.length);
+  sh.hideColumns(C.ID);
+  sh.hideColumns(C.NOMS);    // слепленный текст, для фильтра не годится
+  sh.hideColumns(C.TARIFF);
+  sh.hideColumns(C.AGREE);
 
   // статусы списком
   const rule = SpreadsheetApp.newDataValidation()
@@ -267,23 +343,32 @@ function buildSheet(ss) {
 
   sh.getRange(2, C.FLAG, 3000, NOMS.length)
     .setHorizontalAlignment('center').setFontColor(BLUE).setFontWeight('bold');
+
   sh.getRange(2, C.SUM, 3000, 1).setNumberFormat('#,##0 ₽');
   sh.getRange(2, C.DATE, 3000, 1).setNumberFormat('dd.MM.yyyy HH:mm');
 
+  // фильтр на весь лист: иначе новые заявки окажутся вне его диапазона
   const f = sh.getFilter();
   if (f) f.remove();
-  sh.getRange(1, 1, Math.max(sh.getLastRow(), 2), HEADERS.length).createFilter();
+  sh.getRange(1, 1, sh.getMaxRows(), HEADERS.length).createFilter();
 }
 
 function buildHelper(ss) {
   let h = ss.getSheetByName(HELP);
   if (!h) h = ss.insertSheet(HELP);
   h.clear();
-  h.getRange('A1').setValue('Города — считается автоматически, руками не трогать');
-  h.getRange('A1').setFontWeight('bold');
-  h.getRange('A2').setFormula(
-    '=IFERROR(QUERY(Заявки!G2:G,"select G, count(G) where G is not null and G <> \'\' ' +
-    'group by G order by count(G) desc label G \'Город\', count(G) \'Заявок\'",0),{"Город","Заявок"})');
+  h.getRange('A1').setValue('Считается автоматически, руками не трогать').setFontWeight('bold');
+
+  // сводка по городам
+  h.getRange('A2').setFormula(F(
+    '=IFERROR(QUERY(Заявки!G2:G|"select G, count(G) where G is not null and G <> \'\' ' +
+    'group by G order by count(G) desc label G \'Город\', count(G) \'Заявок\'"|0)|"")'));
+
+  // справочник: номинация → буква столбца с галочками
+  const map = NOMS.map(function (n, i) { return [n, colLetter(C.FLAG + i)]; });
+  h.getRange('D1:E1').setValues([['Номинация', 'Столбец']]).setFontWeight('bold');
+  h.getRange(2, 4, map.length, 2).setValues(map);
+
   h.setColumnWidth(1, 220);
   h.setColumnWidth(2, 100);
   h.hideSheet();
@@ -296,98 +381,158 @@ function buildDashboard(ss) {
   d.getCharts().forEach(function (c) { d.removeChart(c); });
 
   d.setHiddenGridlines(true);
-  [300, 110, 90, 170, 40, 300, 110, 90, 170].forEach(function (w, i) { d.setColumnWidth(i + 1, w); });
+  [280, 120, 90, 190, 40, 260, 120, 90, 190].forEach(function (w, i) { d.setColumnWidth(i + 1, w); });
 
-  d.getRange('A1').setValue('BACK TO BACK 2026 — ДАШБОРД')
+  d.getRange('A1').setValue('BACK TO BACK 2026')
     .setFontSize(18).setFontWeight('bold').setFontColor(BLUE);
-  d.getRange('A2').setValue('Все цифры считаются по листу «Заявки». Руками здесь ничего не вводится.')
-    .setFontSize(10).setFontColor('#8D8D85');
+  d.setRowHeight(1, 28);
 
-  head(d, 'A3:D3', 'ЗАЯВКИ');
-  rows(d, 4, [
-    ['Всего заявок',         '=COUNTA(Заявки!D2:D)'],
-    ['Оплачено',             '=COUNTIF(Заявки!C2:C,"Оплачено")'],
-    ['Скриншот на проверке', '=COUNTIF(Заявки!C2:C,"Скриншот отправлен")'],
-    ['Ждём скриншот',        '=COUNTIF(Заявки!C2:C,"Ждём скриншот")'],
-    ['Отмены и возвраты',    '=COUNTIF(Заявки!C2:C,"Отмена")+COUNTIF(Заявки!C2:C,"Возврат")']
-  ]);
+  const strip = [
+    ['Всего заявок', '=COUNTA(Заявки!D2:D)'],
+    ['Оплачено',     F('=COUNTIF(Заявки!C2:C|"Оплачено")')],
+    ['Собрано, ₽',   F('=SUMIF(Заявки!C2:C|"Оплачено"|Заявки!J2:J)')]
+  ];
+  strip.forEach(function (it, i) {
+    const col = 1 + i * 3;
+    d.getRange(2, col).setValue(it[0]).setFontSize(10).setFontColor('#8D8D85');
+    const c = d.getRange(3, col).setFormula(it[1])
+      .setFontSize(22).setFontWeight('bold').setFontColor(BLUE);
+    if (i === 2) c.setNumberFormat('#,##0 ₽');
+  });
+  d.setRowHeight(3, 32);
 
-  head(d, 'A10:D10', 'ДЕНЬГИ');
-  rows(d, 11, [
-    ['Собрано',      '=SUMIF(Заявки!C2:C,"Оплачено",Заявки!J2:J)',            '#,##0 ₽'],
-    ['На проверке',  '=SUMIF(Заявки!C2:C,"Скриншот отправлен",Заявки!J2:J)',  '#,##0 ₽'],
-    ['Ждём оплату',  '=SUMIF(Заявки!C2:C,"Ждём скриншот",Заявки!J2:J)',       '#,##0 ₽'],
-    ['Средний чек',  '=IFERROR(SUMIF(Заявки!C2:C,"Оплачено",Заявки!J2:J)/COUNTIF(Заявки!C2:C,"Оплачено"),0)', '#,##0 ₽']
-  ]);
-
-  // ---- наполнение номинаций ----
-  head(d, 'A17:D17', 'НАПОЛНЕНИЕ НОМИНАЦИЙ');
-  d.getRange('A18:D18').setValues([['Номинация', 'Заявок', 'Доля', '']])
+  // ---- участники по номинациям ----
+  head(d, 'A5:D5', 'УЧАСТНИКОВ В НОМИНАЦИИ');
+  d.getRange('A6:D6').setValues([['Номинация', 'Участников', 'Доля', '']])
     .setFontWeight('bold').setFontColor('#55554E').setFontSize(10);
   for (let i = 0; i < NOMS.length; i++) {
-    const r = 19 + i;
+    const r = 7 + i;
     const col = colLetter(C.FLAG + i);
-    d.getRange(r, 1).setValue(NOMS[i]);
-    d.getRange(r, 2).setFormula('=COUNTIF(Заявки!' + col + '2:' + col + ',"' + MARK + '")');
-    d.getRange(r, 3).setFormula('=IFERROR(B' + r + '/$B$4,0)').setNumberFormat('0.0%');
-    d.getRange(r, 4).setFormula(
-      '=SPARKLINE(B' + r + ',{"charttype","bar";"max",MAX($B$19:$B$25);"color1","' + BLUE + '"})');
+    d.getRange(r, 1).setValue(NOMS[i]).setFontSize(12);
+    d.getRange(r, 2).setFormula(F('=COUNTIF(Заявки!' + col + '2:' + col + '|"' + MARK + '")'))
+      .setFontWeight('bold').setFontColor(BLUE).setFontSize(13).setHorizontalAlignment('right');
+    d.getRange(r, 3).setFormula(F('=IFERROR(B' + r + '/$B$3|0)'))
+      .setNumberFormat('0%').setHorizontalAlignment('right');
+    d.getRange(r, 4).setFormula(F(
+      '=IF(B' + r + '=0|""|REPT("▮"|MAX(1|ROUND(B' + r + '/MAX($B$7:$B$13)*16|0))))'))
+      .setFontColor('#4A5BF2');
+    d.setRowHeight(r, 24);
   }
-  d.getRange(19, 1, NOMS.length, 4).setBorder(true, true, true, true, true, true, '#E4E2DB',
-    SpreadsheetApp.BorderStyle.SOLID);
-  d.getRange(19, 2, NOMS.length, 1).setFontWeight('bold').setFontColor(BLUE);
-
-  // ---- мастер-классы ----
-  head(d, 'A27:D27', 'МАСТЕР-КЛАССЫ');
-  rows(d, 28, [
-    ['Берут 1 мастер-класс',  '=COUNTIF(Заявки!I2:I,"1 мастер-класс")'],
-    ['Берут 2 мастер-класса', '=COUNTIF(Заявки!I2:I,"2 мастер-класса")'],
-    ['Берут 3 мастер-класса', '=COUNTIF(Заявки!I2:I,"3 мастер-класса")'],
-    ['Всего мест на занятиях', '=COUNTIF(Заявки!I2:I,"1 мастер-класс")+COUNTIF(Заявки!I2:I,"2 мастер-класса")*2+COUNTIF(Заявки!I2:I,"3 мастер-класса")*3']
-  ]);
+  d.getRange(7, 1, NOMS.length, 4)
+    .setBorder(true, true, true, true, true, true, '#E4E2DB', SpreadsheetApp.BorderStyle.SOLID);
 
   // ---- города ----
-  head(d, 'F3:I3', 'ГОРОДА УЧАСТНИКОВ');
-  d.getRange('F4:I4').setValues([['Город', 'Заявок', 'Доля', '']])
+  head(d, 'F5:I5', 'ГОРОДА УЧАСТНИКОВ');
+  d.getRange('F6:I6').setValues([['Город', 'Участников', 'Доля', '']])
     .setFontWeight('bold').setFontColor('#55554E').setFontSize(10);
   for (let i = 0; i < 15; i++) {
-    const r = 5 + i;
-    d.getRange(r, 6).setFormula('=IFERROR(Служебное!A' + (r - 2) + ',"")');
-    d.getRange(r, 7).setFormula('=IFERROR(Служебное!B' + (r - 2) + ',"")');
-    d.getRange(r, 8).setFormula('=IFERROR(G' + r + '/SUM($G$5:$G$19),"")').setNumberFormat('0.0%');
-    d.getRange(r, 9).setFormula(
-      '=IF(G' + r + '="","",SPARKLINE(G' + r + ',{"charttype","bar";"max",MAX($G$5:$G$19);"color1","#4A5BF2"}))');
+    const r = 7 + i;
+    d.getRange(r, 6).setFormula(F('=IFERROR(Служебное!A' + (r - 4) + '|"")')).setFontSize(12);
+    d.getRange(r, 7).setFormula(F('=IFERROR(Служебное!B' + (r - 4) + '|"")'))
+      .setFontWeight('bold').setFontColor(BLUE).setFontSize(13).setHorizontalAlignment('right');
+    d.getRange(r, 8).setFormula(F('=IFERROR(G' + r + '/SUM($G$7:$G$21)|"")'))
+      .setNumberFormat('0%').setHorizontalAlignment('right');
+    d.getRange(r, 9).setFormula(F(
+      '=IF(N(G' + r + ')=0|""|REPT("▮"|MAX(1|ROUND(G' + r + '/MAX($G$7:$G$21)*16|0))))'))
+      .setFontColor('#4A5BF2');
   }
-  d.getRange('F21').setValue('Показаны 15 самых частых городов. Полный список — на скрытом листе «Служебное».')
+  d.getRange('F23').setValue('Показаны 15 самых частых городов.')
     .setFontSize(9).setFontColor('#8D8D85');
 
   buildCharts(ss, d);
 }
 
+/** Два графика под таблицами: столбики по номинациям и круг по городам. */
 function buildCharts(ss, d) {
   d.getCharts().forEach(function (c) { d.removeChart(c); });
+
+  const bar = d.newChart().asColumnChart()
+    .addRange(d.getRange('A6:B13'))
+    .setNumHeaders(1)
+    .setOption('title', 'Участников в каждой номинации')
+    .setOption('legend', { position: 'none' })
+    .setOption('colors', [BLUE])
+    .setOption('width', 500).setOption('height', 300)
+    .setPosition(24, 1, 0, 0)
+    .build();
+  d.insertChart(bar);
 
   const pie = d.newChart().asPieChart()
     .addRange(ss.getSheetByName(HELP).getRange('A2:B17'))
     .setNumHeaders(1)
-    .setOption('title', 'Города участников, доля от всех заявок')
+    .setOption('title', 'Города участников')
     .setOption('pieSliceText', 'percentage')
     .setOption('legend', { position: 'right' })
-    .setOption('width', 520).setOption('height', 320)
-    .setPosition(23, 6, 0, 0)
+    .setOption('width', 500).setOption('height', 300)
+    .setPosition(24, 6, 0, 0)
     .build();
   d.insertChart(pie);
+}
 
-  const bar = d.newChart().asColumnChart()
-    .addRange(d.getRange('A18:B25'))
-    .setNumHeaders(1)
-    .setOption('title', 'Сколько заявок в каждой номинации')
-    .setOption('legend', { position: 'none' })
-    .setOption('colors', [BLUE])
-    .setOption('width', 520).setOption('height', 300)
-    .setPosition(34, 1, 0, 0)
-    .build();
-  d.insertChart(bar);
+/**
+ * По вкладке на каждую номинацию. Список собирается сам и обновляется,
+ * как только приходит новая заявка или ты правишь данные руками.
+ */
+function buildNomSheets(ss) {
+  ss = ss || SpreadsheetApp.getActive();
+  const main = ss.getSheetByName(SHEET);
+  if (!main) { SpreadsheetApp.getUi().alert('Нет листа «Заявки».'); return; }
+  ensureColumns(main, HEADERS.length);
+
+  const old = ss.getSheetByName(LISTS);
+  if (old) ss.deleteSheet(old);
+  dropAttendanceColumn(main);
+
+  NOMS.forEach(function (name, i) {
+    const col = colLetter(C.FLAG + i);
+    let sh = ss.getSheetByName(name);
+    if (!sh) sh = ss.insertSheet(name);
+    sh.clear();
+    // clear() не снимает выпадающие списки и примечания — убираем отдельно,
+    // иначе на месте фамилий остаются стрелки и красные пометки об ошибке
+    sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns())
+      .clearDataValidations().clearNote();
+    sh.showColumns(1, sh.getMaxColumns());
+    sh.setFrozenColumns(0);
+    sh.setConditionalFormatRules([]);
+    sh.setHiddenGridlines(true);
+    sh.setTabColor(BLUE);
+    [240, 190, 150, 150, 170, 110].forEach(function (w, k) { sh.setColumnWidth(k + 1, w); });
+
+    sh.getRange('A1').setValue(name.toUpperCase())
+      .setFontSize(20).setFontWeight('bold').setFontColor(BLUE);
+    sh.setRowHeight(1, 30);
+
+    sh.getRange('A2').setFormula(F(
+      '="Участников: "&COUNTIF(Заявки!' + col + '2:' + col + '|"' + MARK + '")'))
+      .setFontSize(13).setFontWeight('bold');
+    sh.getRange('C2').setFormula(F(
+      '="Оплатили: "&COUNTIFS(Заявки!' + col + '2:' + col + '|"' + MARK + '"' +
+      '|Заявки!C2:C|"Оплачено")'))
+      .setFontSize(13).setFontColor('#159A45').setFontWeight('bold');
+    sh.getRange('A3').setValue('Список собирается сам. Руками здесь ничего не вводится.')
+      .setFontSize(9).setFontColor('#8D8D85');
+
+    sh.getRange('A5').setFormula(F(
+      '=IFERROR(QUERY(Заявки!$A$2:$T|' +
+      '"select D, E, F, G, C, J where ' + col + ' = \'' + MARK + '\' order by D ' +
+      'label D \'Фамилия Имя\', E \'Никнейм\', F \'Телефон\', G \'Город\', ' +
+      'C \'Статус оплаты\', J \'Сумма\'"|0)|"В этой номинации пока никого нет")'));
+
+    sh.getRange('A5:F5').setBackground(BLUE).setFontColor('#FFFFFF')
+      .setFontWeight('bold').setFontSize(10);
+    sh.setRowHeight(5, 26);
+    sh.getRange('F6:F500').setNumberFormat('#,##0 ₽');
+    sh.setFrozenRows(5);
+
+    const rng = sh.getRange('A6:F500');
+    sh.setConditionalFormatRules([
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenFormulaSatisfied('=$E6="Оплачено"').setBackground('#DCF2E1').setRanges([rng]).build(),
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenFormulaSatisfied('=$E6="Скриншот отправлен"').setBackground('#FFF4C9').setRanges([rng]).build()
+    ]);
+  });
 }
 
 function head(sh, a1, text) {
@@ -472,6 +617,16 @@ function buildInfo(ss) {
   });
 }
 
+/** Пересобирает только витрины, данные не трогает. */
+function rebuildViews() {
+  const ss = SpreadsheetApp.getActive();
+  ensureLocale(ss);
+  buildHelper(ss);
+  buildDashboard(ss);
+  buildNomSheets(ss);
+  ss.toast('Дашборд и вкладки номинаций пересобраны', 'Готово', 5);
+}
+
 function out(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
@@ -481,6 +636,8 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('BACK TO BACK')
     .addItem('Собрать таблицу', 'setupWorkbook')
+    .addItem('Пересобрать дашборд и списки номинаций', 'rebuildViews')
+    .addItem('Найти дубли по телефону', 'checkDuplicates')
     .addItem('Пересчитать номинации', 'recalcFlags')
     .addItem('Проставить ID вручную добавленным', 'fillMissingIds')
     .addToUi();
